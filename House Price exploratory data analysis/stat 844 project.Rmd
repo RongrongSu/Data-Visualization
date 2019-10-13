@@ -1,0 +1,1784 @@
+---
+title: "Predicting House Price"
+output:
+  word_document: default
+  html_document: default
+---
+```{r}
+library(knitr)
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(corrplot)
+library(caret)
+library(gridExtra)
+library(scales)
+library(Rmisc)
+library(ggrepel)
+library(randomForest)
+library(psych)
+library(xgboost)
+library(CatEncoders)
+library(data.table)
+library(mgcv)
+library(DAAG)
+library(crs)
+library(Ckmeans.1d.dp) 
+library(splines)
+#library(MASS)
+```
+
+Part 1 data prepocessing:
+
+First read data and take a look at data size and structure
+```{r}
+table<-read.csv('/Users/xhkj/Downloads/house-prices-advanced-regression-techniques/train.csv', stringsAsFactors = F)
+str(table)
+summary(table)
+dim(table)
+```
+
+Avoid ID
+```{r}
+table$Id<-NULL
+```
+
+```{r}
+num_var_name <- names(which(sapply(table, is.numeric))) #index vector numeric variables
+num_var<-which(sapply(table, is.numeric))
+fac_var_name <- names(which(sapply(table, is.character))) #index vector factor variables
+cat('There are', length(num_var_name), 'numeric variables, and', length(fac_var_name), 'categoric variables.', 'In total, there are ',length(num_var_name)+length(fac_var_name), 'variables.')
+
+numvar<-table[,num_var]
+cor_numvar<-cor(numvar)
+sorted_cor <- as.matrix(sort(cor_numvar[,'SalePrice'], decreasing = TRUE))
+effecive_var<-names(which(apply(sorted_cor, 1, function(x) abs(x)>0.5)))
+corrplot(as.matrix(cor_numvar[effecive_var,effecive_var]), 
+         type = 'upper', 
+         method='color', 
+         addCoef.col = 'black', 
+         tl.cex = .7,
+         cl.cex = .7, 
+         number.cex=.7)
+```
+
+Then trying to fill missing values.
+
+Then I look at looking at if there are missing value.
+```{r warning=FALSE}
+na.cols <- which(colSums(is.na(table)) > 0)
+sort(colSums(sapply(table[na.cols], is.na)), decreasing = TRUE)
+```
+
+1.First look at poolQC. poolQC have five values: excellent, good, average, fair, no pool. So the missing values with no poolarea should be no pool. In case of weird records, I investigate information of pool.
+
+```{r}
+table %>% group_by(PoolQC) %>% count()
+```
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+a1<-table %>% select(PoolArea,PoolQC) %>% filter(is.na(PoolQC) & PoolArea==0)
+nrow(a1)
+
+a2<-table %>% select(PoolArea,PoolQC) %>% filter(is.na(table$PoolQC) & table$PoolArea!=0)
+nrow(a2)
+```
+
+And then filling missing value. Since the word means the level of pool, so I decide to treat it as integer: NA(no pool)-0, Fa(fair)=1, Gd(good)=2, Ex(excellent)=3
+```{r}
+table$PoolQC[is.na(table$PoolQC)] <- 'None'
+
+level<-c('None'=0,'Po'=1,'Fa'=2,'TA'=3,'Gd'=4,'Ex'=5)
+table$PoolQC<-as.integer(revalue(table$PoolQC,level))
+table %>% group_by(PoolQC) %>% count()
+```
+
+2.MiscFeature: Miscellaneous Features not covered in other categories
+```{r}
+table %>% group_by(MiscFeature) %>% count()
+```
+Na-None, Car2-2nd Garge, Othr-other, Shed-Shed:over 100 SF, TenC-Tennis Court
+
+```{r}
+table$MiscFeature[is.na(table$MiscFeature)]<-'None'
+table$MiscFeature <- as.factor(table$MiscFeature)
+```
+
+3.Alley:Type of alley access to property
+```{r}
+table %>% group_by(Alley) %>% count()
+```
+NA-No alley access, Grvl-Gravel, Pave-Paved
+```{r}
+table$Alley[is.na(table$Alley)]<-'None'
+table$Alley <- as.factor(table$Alley)
+```
+
+4.Fence:Fence quality
+```{r}
+table %>% group_by(Fence) %>% count()
+```
+NA-No Fence, GdPrv-Good Privacy, GdWo-Good Wood, MnPrv-Minimum Privacy, MnWw-Minimum Wood/Wire
+
+```{r}
+table$Fence[is.na(table$Fence)] <- 'None'
+table$Fence <- as.factor(table$Fence)
+table %>% group_by(Fence) %>% count()
+```
+
+5.FireplaceQu:Fireplace Quality
+  Fireplaces:Number of fireplaces
+  check if data make sense 
+```{r}
+#a<-table %>% select(FireplaceQu,Fireplaces) %>% 
+ # filter(is.na(table$FireplaceQu) & table$Fireplaces>0)
+#nrow(a)
+```
+  
+```{r}
+table %>% group_by(FireplaceQu) %>% count()
+```
+NA-No Fireplace, Ex-Excellent, Fa-Fair, Gd-Good, Po-Poor, TA-Average
+```{r}
+table$FireplaceQu[is.na(table$FireplaceQu)]<-'None'
+```
+
+check if higher level of fireplace will be corresponding to a higher price
+```{r}
+table[!is.na(table$SalePrice),] %>% 
+  group_by(FireplaceQu) %>% 
+  summarise(average=mean(SalePrice),counts=n())
+```
+
+There is a trend that the better quality the higher price.(there is one exception: the average price of None class is larger than that of  Po class, which does meet not us expectation)
+So here I will treat fireplace quality as integer type.
+
+```{r}
+table$FireplaceQu<-as.integer(revalue(table$FireplaceQu,level))
+table %>% group_by(table$FireplaceQu) %>% count() 
+```
+
+6.LotFrontage: Linear feet of street connected to property
+```{r}
+typeof(table$LotFrontage)
+```
+Normally, the houses in the same neigborhood have the similar distance to streets. 
+```{r}
+ggplot(table[!is.na(table$LotFrontage),], aes(x=Neighborhood,y=LotFrontage))+
+  geom_boxplot(outlier.colour='red', outlier.shape=8,outlier.size=2)
+```
+
+Since there so many outliers, I decide to fill in the missing values by median LotFrontage of the neighborhood.
+
+
+```{r}
+table[!is.na(table$LotFrontage),] %>% 
+  group_by(Neighborhood) %>% 
+  summarise(median=median(LotFrontage,na.rm=TRUE))
+```
+
+```{r}
+table<-table %>% 
+  group_by(Neighborhood) %>%
+  mutate(LotFrontage=replace(LotFrontage,is.na(LotFrontage),as.integer(median(LotFrontage,na.rm =TRUE))))
+```
+
+check result
+```{r}
+sum(is.na(table$LotFrontage))
+```
+
+7.variables about: Garage 
+have missing value:
+GarageType:Garage location
+GarageYrBlt:Year garage was built
+GarageFinish: Interior finish of the garage
+GarageQual:Garage quality
+GarageCond:Garage condition
+No missing value:
+GarageCars:Size of garage in car capacity
+GarageArea: Size of garage in square feet
+
+```{r}
+sum(is.na(table$GarageType))
+sum(is.na(table$GarageYrBlt))
+sum(is.na(table$GarageFinish))
+sum(is.na(table$GarageQual))
+sum(is.na(table$GarageCond))
+sum(table$GarageArea==0)
+sum(is.na(table$GarageCond) & 
+      is.na(table$GarageQual) & 
+      is.na(table$GarageFinish) &
+      is.na(table$GarageYrBlt) &
+      is.na(table$GarageType) &
+      table$GarageArea==0 &
+      table$GarageCars==0)
+```
+
+Here I think the house record which has missing values in variables about grage do not have grage.
+1.GarageType: Garage location
+
+```{r}
+table %>% 
+  group_by(GarageType) %>%
+  count()
+```
+
+NA-No Garage, 2Types-More than one type of garage, Attchd-Attached to home, Basment-Basement Garage, BuiltIn-Built-In, CarPort-Car Port, Detchd-Detached from home
+So fill in NA by NONE
+
+```{r}
+table$GarageType[is.na(table$GarageType)] <- 'None'
+table$GarageType <- as.factor(table$GarageType)
+```
+
+2.GarageYrBlt- Year garage was built 
+replace na with the year house was built
+
+```{r}
+table$GarageYrBlt<-ifelse(is.na(table$GarageYrBlt),table$YearBuilt,table$GarageYrBlt)
+sum(is.na(table$GarageYrBlt))
+```
+
+3.GarageFinish- Interior finish of the garage
+
+```{r}
+table %>% 
+  group_by(GarageFinish) %>%
+  count()
+```
+NA-No Garage, Fin-Finished, RFn-Rough Finished, Unf-Unfinished
+
+```{r}
+table$GarageFinish[is.na(table$GarageFinish)] <- 'None'
+level2<-c('None'=0, 'Unf'=1, 'RFn'=2, 'Fin'=3)
+table$GarageFinish<-as.integer(revalue(table$GarageFinish,level2))
+
+table %>% 
+  group_by(GarageFinish) %>%
+  count()
+```
+
+4.GarageQual:Garage quality
+
+```{r}
+table %>% 
+  group_by(GarageQual) %>%
+  count()
+```
+
+fill na by 'None'
+
+```{r}
+table$GarageQual[is.na(table$GarageQual)]<-'None'
+table$GarageQual<-as.integer(revalue(table$GarageQual,level))
+```
+```{r}
+table %>% 
+  group_by(GarageQual) %>%
+  count()
+```
+
+5.GarageCond:Garage condition
+
+```{r}
+table %>% 
+  group_by(GarageCond) %>%
+  count()
+```
+
+```{r}
+table$GarageCond[is.na(table$GarageCond)] <- 'None'
+table$GarageCond<-as.integer(revalue(table$GarageCond,level))
+```
+
+8. variables about basement
+
+missing part
+
+BsmtExposure:Walkout or garden level walls
+BsmtFinType2:Quality of second finished area (if present)  
+BsmtQual:Height of the basement     
+BsmtCond:General condition of the basement
+BsmtFinType1:Quality of basement finished area
+
+no missing part
+
+BsmtFinSF1: Type 1 finished square feet
+BsmtFinSF2: Type 2 finished square feet
+BsmtUnfSF: Unfinished square feet of basement area
+TotalBsmtSF: Total square feet of basement area
+BsmtFullBath: Basement full bathrooms
+BsmtHalfBath: Basement half bathrooms
+
+```{r}
+sum(is.na(table$BsmtExposure))
+sum(is.na(table$BsmtFinType2))
+sum(is.na(table$BsmtQual))
+sum(is.na(table$BsmtCond))
+sum(is.na(table$BsmtFinType1))
+
+sum(is.na(table$BsmtExposure) & 
+      is.na(table$BsmtFinType2) & 
+      is.na(table$BsmtQual) &
+      is.na(table$BsmtCond) &
+      is.na(table$BsmtFinType1))
+
+```
+
+```{r}
+table<-data.frame(table)
+table[!is.na(table$BsmtCond) & (is.na(table$BsmtFinType1)|is.na(table$BsmtQual)|is.na(table$BsmtExposure)|is.na(table$BsmtFinType2)), c('BsmtQual', 'BsmtCond', 'BsmtExposure', 'BsmtFinType1', 'BsmtFinType2')]
+```
+
+There are two irresonable records.
+I will imputate the most common values for these two missing value. 
+```{r}
+table$BsmtFinType2[333] <- names(sort(-table(table$BsmtFinType2)))[1]
+table$BsmtExposure[949] <- names(sort(-table(table$BsmtExposure)))[1]
+```
+
+Than look at the rest ordonary variables.
+1.BsmtQual:Height of the basement
+
+
+```{r}
+table %>% 
+  group_by(BsmtQual) %>%
+  count()
+```
+
+```{r}
+table$BsmtQual[is.na(table$BsmtQual)] <- 'None'
+table$BsmtQual<-as.integer(revalue(table$BsmtQual, level))
+table %>% 
+  group_by(BsmtQual) %>%
+  count()
+```
+
+2.BsmtCond: General condition of the basement
+
+```{r}
+table %>% 
+  group_by(BsmtCond) %>%
+  count()
+```
+
+```{r}
+table$BsmtCond[is.na(table$BsmtCond)] <- 'None'
+table$BsmtCond<-as.integer(revalue(table$BsmtCond, level))
+table %>% 
+  group_by(BsmtCond) %>%
+  count()
+```
+
+3.BsmtExposure: Walkout or garden level walls
+
+```{r}
+table %>% 
+  group_by(BsmtExposure) %>%
+  count()
+```
+
+NA-No Basement, No-No Exposure, Mn-Mimimum Exposure, Av-Average Exposure, Gd-Good Exposure
+
+```{r}
+table$BsmtExposure[is.na(table$BsmtExposure)] <- 'None'
+level3<-c('None'=0, 'No'=1, 'Mn'=2, 'Av'=3, 'Gd'=4)
+table$BsmtExposure<-as.integer(revalue(table$BsmtExposure, level3))
+table %>% 
+  group_by(BsmtExposure) %>%
+  count()
+```
+
+4.BsmtFinType1: Rating of basement finished area
+```{r}
+table %>% 
+  group_by(BsmtFinType1) %>%
+  count()
+```
+
+GLQ  Good Living Quarters
+ALQ  Average Living Quarters
+BLQ  Below Average Living Quarters   
+Rec  Average Rec Room
+LwQ  Low Quality
+Unf  Unfinshed
+NA   No Basement
+
+```{r}
+table$BsmtFinType1[is.na(table$BsmtFinType1)] <- 'None'
+level4 <- c('None'=0, 'Unf'=1, 'LwQ'=2, 'Rec'=3, 'BLQ'=4, 'ALQ'=5, 'GLQ'=6)
+table$BsmtFinType1<-as.integer(revalue(table$BsmtFinType1, level4))
+table %>% 
+  group_by(BsmtFinType1) %>%
+  count()
+```
+
+5.BsmtFinType2: Rating of basement finished area
+```{r}
+table %>% 
+  group_by(BsmtFinType2) %>%
+  count()
+```
+
+```{r}
+table$BsmtFinType2[is.na(table$BsmtFinType2)] <- 'None'
+table$BsmtFinType2<-as.integer(revalue(table$BsmtFinType2, level4))
+table %>% 
+  group_by(BsmtFinType2) %>%
+  count()
+```
+
+Finally check again
+```{r}
+sum(is.na(table$BsmtExposure))
+sum(is.na(table$BsmtFinType2))
+sum(is.na(table$BsmtQual))
+sum(is.na(table$BsmtCond))
+sum(is.na(table$BsmtFinType1))
+```
+
+9.Masonry variables
+MasVnrType: Masonry veneer type
+MasVnrArea: Masonry veneer area
+check if data is reasonable
+```{r}
+sum(is.na(table$MasVnrType))
+sum(is.na(table$MasVnrArea))
+sum(is.na(table$MasVnrArea) & is.na(table$MasVnrType))
+```
+
+1.MasVnrType: Masonry veneer type
+
+```{r}
+table %>% 
+  group_by(MasVnrType) %>%
+  count()
+```
+NA       None
+BrkCmn   Brick Common
+BrkFace  Brick Face
+CBlock   Cinder Block
+None     None
+Stone    Stone
+```{r}
+table$MasVnrType[is.na(table$MasVnrType)] <- 'None'
+```
+
+```{r}
+table[!is.na(table$SalePrice),] %>% 
+  group_by(MasVnrType) %>% 
+  summarise(mean=mean(SalePrice)) %>%
+  arrange(mean)
+```
+
+Clearly, there is a trend. So I will encode this variable
+level5 is for MasVnrType
+```{r}
+level5 <- c('None'=0, 'BrkCmn'=1, 'BrkFace'=2, 'Stone'=3)
+table$MasVnrType<-as.integer(revalue(table$MasVnrType, level5))
+table %>% 
+  group_by(MasVnrType) %>%
+  count()
+```
+
+2.MasVnrArea:Masonry veneer area
+
+```{r}
+table$MasVnrArea[is.na(table$MasVnrArea)] <-0
+```
+
+10.Electrical:Electrical system
+
+```{r}
+table %>% 
+  group_by(Electrical) %>%
+  count()
+```
+
+I will imputate the most common values for these two missing value.  Or here I can just delete it.
+
+```{r}
+table$Electrical[is.na(table$Electrical)] <- names(sort(-table(table$Electrical)))[1]
+table$Electrical <- as.factor(table$Electrical)
+```
+
+```{r}
+table %>% 
+  group_by(Electrical) %>%
+  count()
+```
+
+factor variables without missing value
+```{r}
+factor_va <- names(table[,sapply(table, is.character)])
+```
+
+1.MSZoning:general zoning classification of the sale
+```{r}
+table %>% 
+  group_by(MSZoning) %>%
+  count()
+```
+
+C    Commercial
+FV   Floating Village Residential
+RH   Residential High Density
+RL   Residential Low Density
+RM   Residential Medium Density
+
+```{r}
+table$MSZoning <- as.factor(table$MSZoning)
+```
+
+2.Street:Type of road access to property
+
+```{r}
+table %>% 
+  group_by(Street) %>%
+  count()
+```
+
+```{r}
+table$Street <- as.factor(table$Street)
+```
+
+3.LotShape:General shape of property
+
+```{r}
+table %>% 
+  group_by(LotShape) %>%
+  count()
+```
+level6:
+Reg	Regular	
+IR1	Slightly irregular
+IR2	Moderately Irregular
+IR3	Irregular
+
+```{r}
+level6<-c('IR3'=0, 'IR2'=1, 'IR1'=2, 'Reg'=3)
+table$LotShape<-as.integer(revalue(table$LotShape,level6 ))
+```
+```{r}
+table %>% 
+  group_by(LotShape) %>%
+  count()
+```
+
+4.LandContour:Flatness of the property
+
+```{r}
+table %>% 
+  group_by(LandContour) %>%
+  count()
+```
+
+Bnk	Banked(Quick and significant rise from street grade to building) 
+HLS	Hillside(Significant slope from side to side)
+Low	Depression
+Lvl	Near Flat/Level	
+
+```{r}
+table$LandContour <- as.factor(table$LandContour)
+```
+
+5.Utilities:Type of utilities available
+
+```{r}
+table %>% 
+  group_by(Utilities) %>%
+  count()
+```
+
+This variable does not important drop it.
+
+```{r}
+table$Utilities<-NULL
+```
+
+6.LotConfig:Lot configuration
+
+```{r}
+table %>% 
+  group_by(LotConfig) %>%
+  count()
+```
+
+Corner	Corner lot
+CulDSac	Cul-de-sac
+FR2	Frontage on 2 sides of property
+FR3	Frontage on 3 sides of property
+Inside	Inside lot
+
+```{r}
+table$LotConfig <- as.factor(table$LotConfig)
+```
+
+7.LandSlope:Slope of property
+
+```{r}
+table %>% 
+  group_by(LandSlope) %>%
+  count()
+```
+
+level7:
+Gtl	Gentle slope
+Mod	Moderate Slope	
+Sev	Severe Slope
+
+```{r}
+level7<-c('Sev'=0, 'Mod'=1, 'Gtl'=2)
+table$LandSlope<-as.integer(revalue(table$LandSlope,level7))
+```
+
+8.Neighborhood:Physical locations within Ames city limits
+
+```{r}
+table$Neighborhood <- as.factor(table$Neighborhood)
+```
+
+9.Condition1:Proximity to various conditions
+
+```{r}
+table %>% 
+  group_by(Condition1) %>%
+  count()
+```
+
+Artery	Adjacent to arterial street
+Feedr	Adjacent to feeder street	
+Norm	Normal	
+RRNn	Within 200' of North-South Railroad
+RRAn	Adjacent to North-South Railroad
+PosN	Near positive off-site feature--park, greenbelt, etc.
+PosA	Adjacent to postive off-site feature
+RRNe	Within 200' of East-West Railroad
+RRAe	Adjacent to East-West Railroad
+
+```{r}
+table$Condition1 <- as.factor(table$Condition1)
+```
+
+10.Condition2:Proximity to various conditions
+
+```{r}
+table %>% 
+  group_by(Condition2) %>%
+  count()
+```
+
+```{r}
+table$Condition2 <- as.factor(table$Condition2)
+```
+
+11.BldgType: Type of dwelling
+
+```{r}
+table %>% 
+  group_by(BldgType) %>%
+  count()
+```
+
+1Fam	  Single-family Detached	
+2FmCon	Two-family Conversion; originally built as one-family dwelling
+Duplx	  Duplex
+TwnhsE	Townhouse End Unit
+TwnhsI	Townhouse Inside Unit
+
+```{r}
+table$BldgType <- as.factor(table$BldgType)
+```
+
+12.HouseStyle: Style of dwelling
+
+```{r}
+table %>% 
+  group_by(HouseStyle) %>%
+  count()
+```
+
+1Story	One story
+1.5Fin	One and one-half story: 2nd level finished
+1.5Unf	One and one-half story: 2nd level unfinished
+2Story	Two story
+2.5Fin	Two and one-half story: 2nd level finished
+2.5Unf	Two and one-half story: 2nd level unfinished
+SFoyer	Split Foyer
+SLvl	Split Level
+
+```{r}
+table$HouseStyle <- as.factor(table$HouseStyle)
+```
+
+13.RoofStyle: Type of roof
+
+```{r}
+table %>% 
+  group_by(RoofStyle) %>%
+  count()
+```
+
+Flat	Flat
+Gable	Gable
+Gambrel	Gabrel (Barn)
+Hip	Hip
+Mansard	Mansard
+Shed	Shed
+
+```{r}
+table$RoofStyle <- as.factor(table$RoofStyle)
+```
+
+14.RoofMatl:Roof material
+
+```{r}
+table %>% 
+  group_by(RoofMatl) %>%
+  count()
+```
+
+ClyTile	Clay or Tile
+CompShg	Standard (Composite) Shingle
+Membran	Membrane
+Metal	Metal
+Roll	Roll
+Tar&Grv	Gravel & Tar
+WdShake	Wood Shakes
+WdShngl	Wood Shingles
+
+```{r}
+table$RoofMatl <- as.factor(table$RoofMatl)
+```
+
+15.Exterior1st:Exterior covering on house
+
+```{r}
+table %>% 
+  group_by(Exterior1st) %>%
+  count()
+```
+
+AsbShng	Asbestos Shingles
+AsphShn	Asphalt Shingles
+BrkComm	Brick Common
+BrkFace	Brick Face
+CBlock	Cinder Block
+CemntBd	Cement Board
+HdBoard	Hard Board
+ImStucc	Imitation Stucco
+MetalSd	Metal Siding
+Other	Other
+Plywood	Plywood
+PreCast	PreCast	
+Stone	Stone
+Stucco	Stucco
+VinylSd	Vinyl Siding
+Wd Sdng	Wood Siding
+WdShing	Wood Shingles
+
+```{r}
+table$Exterior1st <- as.factor(table$Exterior1st)
+```
+
+16.Exterior2nd: Exterior covering on house
+
+```{r}
+table$Exterior2nd <- as.factor(table$Exterior2nd)
+```
+
+17.ExterQual: Evaluates the quality of the material on the exterior
+
+```{r}
+table %>% 
+  group_by(ExterQual) %>%
+  count()
+```
+
+```{r}
+table$ExterQual<-as.integer(revalue(table$ExterQual, level))
+```
+
+18.ExterCond: Evaluates the present condition of the material on the exterior
+
+```{r}
+table %>% 
+  group_by(ExterCond) %>%
+  count()
+```
+
+```{r}
+table$ExterCond<-as.integer(revalue(table$ExterCond, level))
+```
+
+19.Foundation:  Type of foundation
+
+```{r}
+table %>% 
+  group_by(Foundation) %>%
+  count()
+```
+
+BrkTil          Brick & Tile
+CBlock	        Cinder Block
+PConc	        Poured Contrete	
+Slab	        Slab
+Stone	        Stone
+Wood	        Wood
+
+```{r}
+table$Foundation <- as.factor(table$Foundation)
+```
+
+20.Heating: Type of heating
+
+```{r}
+table %>% 
+  group_by(Heating) %>%
+  count()
+```
+
+Floor	Floor Furnace
+GasA	Gas forced warm air furnace
+GasW	Gas hot water or steam heat
+Grav	Gravity furnace	
+OthW	Hot water or steam heat other than gas
+Wall	Wall furnace
+
+```{r}
+table$Heating <- as.factor(table$Heating)
+```
+
+21.HeatingQC: Heating quality and condition
+
+```{r}
+table %>% 
+  group_by(HeatingQC) %>%
+  count()
+```
+
+```{r}
+table$HeatingQC<-as.integer(revalue(table$HeatingQC, level))
+```
+
+22.CentralAir: Central air conditioning
+
+```{r}
+table %>% 
+  group_by(CentralAir) %>%
+  count()
+```
+
+```{r}
+table$CentralAir<-as.integer(revalue(table$CentralAir, c('N'=0, 'Y'=1)))
+```
+
+23.KitchenQual: Kitchen quality
+
+```{r}
+table %>% 
+  group_by(KitchenQual) %>%
+  count()
+```
+```{r}
+table$KitchenQual<-as.integer(revalue(table$KitchenQual, level))
+```
+
+24.Functional: Home functionality
+
+```{r}
+table %>% 
+  group_by(Functional) %>%
+  count()
+```
+
+level 8
+Typ	Typical Functionality
+Min1	Minor Deductions 1
+Min2	Minor Deductions 2
+Mod	Moderate Deductions
+Maj1	Major Deductions 1
+Maj2	Major Deductions 2
+Sev	Severely Damaged
+Sal	Salvage only
+
+```{r}
+level8<-c('Sal'=0, 'Sev'=1, 'Maj2'=2, 'Maj1'=3, 'Mod'=4, 'Min2'=5, 'Min1'=6, 'Typ'=7)
+table$Functional <- as.integer(revalue(table$Functional,level8))
+```
+
+25.PavedDrive: Paved driveway
+
+```{r}
+table %>% 
+  group_by(PavedDrive) %>%
+  count()
+```
+
+level 9
+Y	Paved 
+P	Partial Pavement
+N	Dirt/Gravel
+
+```{r}
+level9<-c('N'=0, 'P'=1, 'Y'=2)
+table$PavedDrive<-as.integer(revalue(table$PavedDrive,level9))
+```
+
+26.SaleType: Type of sale
+
+```{r}
+table %>% 
+  group_by(SaleType) %>%
+  count()
+```
+
+WD 	Warranty Deed - Conventional
+CWD	Warranty Deed - Cash
+VWD	Warranty Deed - VA Loan
+New	Home just constructed and sold
+COD	Court Officer Deed/Estate
+Con	Contract 15% Down payment regular terms
+ConLw	Contract Low Down payment and low interest
+ConLI	Contract Low Interest
+ConLD	Contract Low Down
+Oth	Other
+
+```{r}
+table$SaleType <- as.factor(table$SaleType)
+```
+
+28.SaleCondition: Condition of sale
+
+```{r}
+table %>% 
+  group_by(SaleCondition) %>%
+  count()
+```
+
+Normal	Normal Sale
+Abnorml	Abnormal Sale(trade, foreclosure, short sale)
+AdjLand	Adjoining Land Purchase
+Alloca	Allocation 
+Family	Sale between family members
+Partial	Home was not completed when last assessed 
+
+```{r}
+table$SaleCondition <- as.factor(table$SaleCondition)
+```
+
+Next cosider numeric variables.
+
+1.I will treat year and month as factor variable
+
+```{r}
+str(table$YrSold)
+table$MoSold <- as.factor(table$MoSold)
+str(table$MoSold)
+table$MoSold <- as.factor(table$MoSold)
+```
+
+2.MSSubClass: Identifies the type of dwelling involved in the sale.
+
+```{r}
+table %>% 
+  group_by(MSSubClass) %>%
+  count()
+```
+
+level 10:
+20  1-STORY 1946 & NEWER ALL STYLES
+30  1-STORY 1945 & OLDER
+40  1-STORY W/FINISHED ATTIC ALL AGES
+45  1-1/2 STORY - UNFINISHED ALL AGES
+50  1-1/2 STORY FINISHED ALL AGES
+60  2-STORY 1946 & NEWER
+70  2-STORY 1945 & OLDER
+75  2-1/2 STORY ALL AGES
+80  SPLIT OR MULTI-LEVEL
+85  SPLIT FOYER
+90  DUPLEX - ALL STYLES AND AGES
+120  1-STORY PUD (Planned Unit Development) - 1946 & NEWER
+150  1-1/2 STORY PUD - ALL AGES
+160  2-STORY PUD - 1946 & NEWER
+180  PUD - MULTILEVEL - INCL SPLIT LEV/FOYER
+190  2 FAMILY CONVERSION - ALL STYLES AND AGES
+
+```{r}
+level10<-c('20'='1 story 1946+', '30'='1 story 1945-', '40'='1 story unf attic', '45'='1,5 story unf', '50'='1,5 story fin', '60'='2 story 1946+', '70'='2 story 1945-', '75'='2,5 story all ages', '80'='split/multi level', '85'='split foyer', '90'='duplex all style/age', '120'='1 story PUD 1946+', '150'='1,5 story PUD all', '160'='2 story PUD 1946+', '180'='PUD multilevel', '190'='2 family conversion')
+table$MSSubClass<-as.factor(table$MSSubClass)
+table$MSSubClass <- revalue(table$MSSubClass,level10)
+str(table$MSSubClass)
+```
+
+Since area related features are very important to determine house prices, I add one more feature which is the total area of basement, first and second floor areas of each house.
+
+```{r}
+table$TotalArea<-table$TotalBsmtSF+table$X1stFlrSF+table$X2ndFlrSF
+```
+
+Part2: Feature Engineering
+
+1. correlation matrix - correlation between numeric variables and saleprice
+
+
+1. OverallQual: Overall material and finish quality
+```{r}
+g1<-ggplot(data=table[!is.na(table$SalePrice),], aes(x=factor(OverallQual), y=SalePrice))+
+        geom_boxplot(col='blue') + labs(x='Overall Quality') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+g2<-ggplot(data=table, aes(x=factor(OverallQual))) +
+        geom_histogram(stat='count') + labs(x='Overall Quality')
+
+layout <- matrix(c(1,2),1,2,byrow=TRUE)
+multiplot(g1, g2, layout=layout)        
+```
+
+*
+The positive correlation is certainly there indeed, and seems to be a slightly upward curve. Regarding outliers, I do not see any extreme values. If there is a candidate to take out as an outlier later on, it seems to be the expensive house with grade 4, 8, 9 and 10.
+
+2. TotalArea: Total area of basement(and drop )
+```{r}
+g1<-ggplot(data=table[!is.na(table$SalePrice),], aes(x=TotalArea, y=SalePrice))+
+        geom_point(col='black') + 
+        geom_smooth(method = 'lm', se=FALSE, color='steelblue', aes(group=1)) +
+        geom_smooth(method='loess', fill='orange', color='orange') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_text_repel(aes(label = ifelse(table$TotalArea[!is.na(table$SalePrice)]>7500, rownames(table), '')))
+  
+g2<-ggplot(data= table, aes(x=TotalArea)) +
+  geom_density() + labs(x='Total Area')
+
+multiplot(g1, g2, layout=layout)        
+```
+
+It seems there are two outliers. And their labels are 524 and 1299.
+
+3. GrLivArea: Above grade (ground) living area square feet (totalarea and it correlation high)
+
+```{r}
+g1<-ggplot(data=table[!is.na(table$SalePrice),], aes(x=GrLivArea, y=SalePrice))+
+        geom_point(col='black') + 
+        geom_smooth(method = 'lm', se=FALSE, color='steelblue', aes(group=1)) +
+        geom_smooth(method='loess', fill='orange', color='orange') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_text_repel(aes(label = ifelse(table$GrLivArea[!is.na(table$SalePrice)]>4500, rownames(table), '')))
+
+g2<-ggplot(data= table, aes(x=GrLivArea)) +
+  geom_density() + labs(x='Square feet living area')
+
+multiplot(g1, g2, layout=layout)    
+```
+
+It seems there are two outliers. And their labels are 524 and 1299.
+
+4. ExterQual
+
+```{r}
+g1<-ggplot(data=table[!is.na(table$SalePrice),], aes(x=factor(OverallQual), y=SalePrice))+
+        geom_boxplot(col='blue') + labs(x='Overall Quality') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+g2<-ggplot(data=table, aes(x=factor(OverallQual))) +
+        geom_histogram(stat='count') + labs(x='Overall Quality')
+
+```
+
+5. KitchenQual
+6. GarageCars: Size of garage in car capacity
+7. GarageArea: Size of garage in square feet(correlation are high)
+8. TotalBsmtSF, X1stFlrSF (correlation between total high)
+9. BsmtQual:
+10. FullBath: Full bathrooms above grade
+11. GarageFinish:
+12. TotRmsAbvGrd: Total rooms above grade (does not include bathrooms) (strong correlation between GrLivArea and TotRmsAbvGrd )
+13. YearBuilt: Original construction date (strong correlation between YearBuilt and GarageYrBlt)
+14. FireplaceQu
+15. YearRemodAdd: Remodel date (strong correlation between YearBuilt and YearRemodAdd, and ExterQual, KitchenQual)
+
+Next look at the regression and smooth line with respect to each variable.
+
+```{r warning=FALSE}
+require(GGally)
+lm.plt <- function(data, mapping, ...){
+   plt <- ggplot(data = data, mapping = mapping) + 
+    geom_point(shape = 20, alpha = 0.7, color = 'darkseagreen') +
+    geom_smooth(method=loess, fill='orange', color='orange') +
+    geom_smooth(method=lm, fill='steelblue', color='steelblue') +
+    theme_minimal()
+  return(plt)
+}
+ggpairs(table, effecive_var[1:5], lower = list(continuous = lm.plt))
+ggpairs(table, effecive_var[c(1,6:11)], lower = list(continuous = lm.plt))
+```
+
+Now take a look at detatiled information.
+1.
+
+
+
+Then I use random forest to pick up the first 20 important variables.
+
+```{r}
+set.seed(1)
+rf<-randomForest(x=table[,-80], y=table$SalePrice, ntree=100,importance=TRUE)
+imp_rf<-importance(rf)
+imp_df<-data.frame(Variables = row.names(imp_rf), MSE = imp_rf[,1])
+imp_df<-imp_df[order(imp_df$MSE, decreasing = TRUE),]
+```
+
+```{r}
+ggplot(imp_df[1:25,], aes(x=reorder(Variables, MSE), y=MSE, fill=MSE)) + 
+  geom_bar(stat='identity',fill="steelblue") + 
+  labs(x='Variables', y='IncMSE') + 
+  geom_text(aes(label=round(MSE,2)),vjust=1.6, color="white", size=2)+
+  theme(axis.text=element_text(size=5),legend.position="none")
+```
+
+```{r}
+num_num<-intersect(num_var_name,imp_df$Variables[1:25])
+cat('There are ',length(num_num),'numeric variables and they are', num_num, "\n" )
+
+num_fac<-intersect(fac_var_name,imp_df$Variables[1:25])
+cat('There are ',length(fac_var_name),'factor variables and they are', num_fac )
+```
+
+1.Above Ground Living Area and other related variables
+GrLivArea = X1stFlrSF+X2ndFlrSF+LowQualFinSF 
+TotalArea = TotalBsmtSF+X1stFlrSF+X2ndFlrSF
+X1stFlrSF
+X2ndFlrSF
+
+```{r}
+g1<-ggplot(data=table[!is.na(table$SalePrice),], aes(x=GrLivArea, y=SalePrice))+
+        geom_point(col='black') + 
+        geom_smooth(method = 'lm', se=FALSE, color='steelblue', aes(group=1)) +
+        geom_smooth(method='loess', fill='orange', color='orange') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_text_repel(aes(label = ifelse(table$GrLivArea[!is.na(table$SalePrice)]>4500, rownames(table), '')))
+g2<-ggplot(data= table, aes(x=GrLivArea)) +
+  geom_density() + labs(x='Square feet living area')
+
+g3<-ggplot(data=table[!is.na(table$SalePrice),], aes(x=TotalArea, y=SalePrice))+
+        geom_point(col='black') + 
+        geom_smooth(method = 'lm', se=FALSE, color='steelblue', aes(group=1)) +
+        geom_smooth(method='loess', fill='orange', color='orange') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_text_repel(aes(label = ifelse(table$TotalArea[!is.na(table$SalePrice)]>7500, rownames(table), '')))
+g4<-ggplot(data= table, aes(x=TotalArea)) +
+  geom_density() + labs(x='Total Area')
+
+g5<-ggplot(data=table, aes(x=factor(TotRmsAbvGrd),y=SalePrice))+
+        geom_boxplot(col='blue') + labs(x='Rooms above Ground') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+g6 <- ggplot(data=table, aes(x=factor(TotRmsAbvGrd))) +
+        geom_histogram(stat='count') + labs(x='Rooms above Ground')
+
+g7<-ggplot(data=table[!is.na(table$SalePrice),], aes(x=X1stFlrSF, y=SalePrice))+
+        geom_point(col='black') + 
+        geom_smooth(method = 'lm', se=FALSE, color='steelblue', aes(group=1)) +
+        geom_smooth(method='loess', fill='orange', color='orange') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)+
+        geom_text_repel(aes(label = ifelse(table$X1stFlrSF[!is.na(table$SalePrice)]>4000, rownames(table), '')))
+g8 <- ggplot(data= table, aes(x=X1stFlrSF)) +
+        geom_density() + labs(x='Square feet first floor')
+
+g9<-ggplot(data=table[!is.na(table$SalePrice),], aes(x=X2ndFlrSF, y=SalePrice))+
+        geom_point(col='black') + 
+        geom_smooth(method = 'lm', se=FALSE, color='steelblue', aes(group=1)) +
+        geom_smooth(method='loess', fill='orange', color='orange') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+g10 <- ggplot(data= table, aes(x=X2ndFlrSF))+
+        geom_density() + labs(x='Square feet second floor')
+
+g11<-ggplot(data=table[!is.na(table$SalePrice),], aes(x=TotalBsmtSF, y=SalePrice))+
+        geom_point(col='black') + 
+        geom_smooth(method = 'lm', se=FALSE, color='steelblue', aes(group=1)) +
+        geom_smooth(method='loess', fill='orange', color='orange') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)+
+        geom_text_repel(aes(label = ifelse(table$TotalBsmtSF[!is.na(table$SalePrice)]>6000, rownames(table), '')))
+g12<- ggplot(data= table, aes(x=TotalBsmtSF)) +
+        geom_density() + labs(x='Square feet basement')
+
+g13<-ggplot(data=table[!is.na(table$SalePrice),], aes(x=LotArea, y=SalePrice))+
+        geom_point(col='black') + 
+        geom_smooth(method = 'lm', se=FALSE, color='steelblue', aes(group=1)) +
+        geom_smooth(method='loess', fill='orange', color='orange') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_text_repel(aes(label = ifelse(table$LotArea[!is.na(table$SalePrice)]>150000, rownames(table), '')))
+g14 <- ggplot(data=table, aes(x=LotArea)) +
+        geom_density() + labs(x='Square feet lot')
+
+g15<-ggplot(data=table[!is.na(table$SalePrice),], aes(x=LotFrontage, y=SalePrice))+
+        geom_point(col='black') + 
+        geom_smooth(method = 'lm', se=FALSE, color='steelblue', aes(group=1)) +
+        geom_smooth(method='loess', fill='orange', color='orange') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)+
+        geom_text_repel(aes(label = ifelse(table$LotFrontage[!is.na(table$SalePrice)]>300, rownames(table), '')))
+g16 <- ggplot(data= table, aes(x=LotFrontage)) +
+        geom_density() + labs(x='Linear feet lot frontage')
+
+
+g17<-ggplot(data=table[!is.na(table$SalePrice),], aes(x=LowQualFinSF, y=SalePrice))+
+        geom_point(col='black') + 
+        geom_smooth(method = 'lm', se=FALSE, color='steelblue', aes(group=1)) +
+        geom_smooth(method='loess', fill='orange', color='orange') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+g18 <- ggplot(data= table, aes(x=LowQualFinSF)) +
+        geom_histogram() + labs(x='Low quality square feet 1st & 2nd')
+
+layout <- matrix(c(1:8),4,2,byrow=TRUE)
+multiplot(g1, g2, g3, g4, g5, g6, g7, g8, layout=layout)
+
+layout2 <- matrix(c(1:10),5,2,byrow=TRUE)
+multiplot(g9,g10, g11, g12, g13, g14, g15, g16, g17, g18, layout=layout2)
+```
+
+2. Garage variables
+*
+Several Garage variables have a high correlation with SalePrice, and are also in the top-20 list of the quick random forest. However, there is multicolinearity among them and I think that 7 garage variables is too many anyway. I feel that something like 3 variables should be sufficient (possibly GarageCars, GarageType, and a Quality measurement), but before I do any selection I am visualizing all of them in this section.
+
+```{r}
+g1<-ggplot(data=table[!is.na(table$SalePrice),], aes(x=GarageYrBlt, y=SalePrice))+
+        geom_point(col='black') + 
+        labs(x='Garage Built Year')+
+        geom_smooth(method = 'lm', se=FALSE, color='steelblue', aes(group=1)) +
+        geom_smooth(method='loess', fill='orange', color='orange') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) 
+g2 <- ggplot(data=table[table$GarageYrBlt !=0,], aes(x=GarageYrBlt)) +
+        geom_histogram()
+
+g3<-ggplot(data=table, aes(x=factor(GarageCars),y=SalePrice))+
+        geom_boxplot(col='steelblue') + 
+        labs(x='Garage Cars') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+g4 <- ggplot(data=table, aes(x=as.factor(GarageCars))) +
+        geom_histogram(stat='count')
+
+g5<-ggplot(data=table[!is.na(table$SalePrice),], aes(x=GarageArea, y=SalePrice))+
+        geom_point(col='black') + 
+        geom_smooth(method = 'lm', se=FALSE, color='steelblue', aes(group=1)) +
+        geom_smooth(method='loess', fill='orange', color='orange') +
+        labs(x='Garage Area')+
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)+
+        geom_text_repel(aes(label = ifelse(table$GarageArea[!is.na(table$SalePrice)]>1250, rownames(table), ''))) 
+g6 <- ggplot(data= table, aes(x=GarageArea)) +
+        geom_density()
+
+g7<-ggplot(data=table, aes(x=factor(GarageCond),y=SalePrice))+
+        geom_boxplot(col='steelblue') + labs(x='Garage Condition') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+g8 <- ggplot(data=table, aes(x=as.factor(GarageCond))) +
+        geom_histogram(stat='count')
+
+g9<-ggplot(data=table, aes(x=factor(GarageType),y=SalePrice))+
+        geom_boxplot(col='steelblue') + labs(x='Garage Type') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+g10 <- ggplot(data=table, aes(x=GarageType)) +
+        geom_histogram(stat='count')
+
+g11<-ggplot(data=table, aes(x=factor(GarageQual),y=SalePrice))+
+        geom_boxplot(col='steelblue') + labs(x='Garage Type') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+g12 <- ggplot(data=table, aes(x=as.factor(GarageQual))) +
+        geom_histogram(stat='count')
+
+g13<-ggplot(data=table, aes(x=factor(GarageFinish),y=SalePrice))+
+        geom_boxplot(col='steelblue') + labs(x='Garage Finish') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+g14 <- ggplot(data=table, aes(x=as.factor(GarageFinish))) +
+        geom_histogram(stat='count')
+
+layout <- matrix(c(1:8),4,2,byrow=TRUE)
+multiplot(g1, g2, g3, g4, g5, g6, g7, g8, layout=layout)
+layout2 <- matrix(c(1:6),3,2,byrow=TRUE)
+multiplot(g9,g10, g11, g12, g13, g14, layout=layout2)
+```
+
+*
+As already mentioned in section 4.2, GarageCars and GarageArea are highly correlated. Here, GarageQual and GarageCond also seem highly correlated, and both are dominated by level=3.
+
+3. Basement variables
+
+*
+Similar the garage variables, multiple basement variables are important in the correlations matrix and the Top 20 RF predictors list. However, 11 basement variables seems an overkill. Before I decide what I am going to do with them, I am visualizing 8 of them below. 
+
+```{r}
+b1<-ggplot(data=table[!is.na(table$SalePrice),], aes(x=BsmtFinSF1, y=SalePrice))+
+        geom_point(col='black') + 
+        geom_smooth(method = 'lm', se=FALSE, color='steelblue', aes(group=1)) +
+        geom_smooth(method='loess', fill='orange', color='orange') +
+        labs(x='Type 1 finished square feet')+
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+b2 <- ggplot(data=table, aes(x=BsmtFinSF1)) +
+        geom_histogram() + labs(x='Type 1 finished square feet')
+
+b3<-ggplot(data=table[!is.na(table$SalePrice),], aes(x=BsmtFinSF2, y=SalePrice))+
+        geom_point(col='black') + 
+        geom_smooth(method = 'lm', se=FALSE, color='steelblue', aes(group=1)) +
+        geom_smooth(method='loess', fill='orange', color='orange') +
+        labs(x='Type 2 finished square feet')+
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+b4 <- ggplot(data=table, aes(x=BsmtFinSF2)) +
+        geom_histogram()+ labs(x='Type 2 finished square feet')
+
+b5<-ggplot(data=table[!is.na(table$SalePrice),], aes(x=BsmtUnfSF, y=SalePrice))+
+        geom_point(col='black') + 
+        geom_smooth(method = 'lm', se=FALSE, color='steelblue', aes(group=1)) +
+        geom_smooth(method='loess', fill='orange', color='orange') +
+        labs(x='Unfinished square feet')+
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+b6<-ggplot(data=table, aes(x=BsmtUnfSF)) +
+        geom_histogram()+ labs(x='Unfinished square feet')
+
+b7<-ggplot(data=table, aes(x=factor(BsmtFinType1),y=BsmtFinType2))+
+        geom_boxplot(col='steelblue') + labs(x='Rating of Type 1 finished area') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+b8<- ggplot(data=table, aes(x=as.factor(BsmtFinType1))) +
+        geom_histogram(stat='count')+ labs(x='Rating of Type 1 finished area')
+
+b9<-ggplot(data=table, aes(x=factor(BsmtQual),y=BsmtFinType2))+
+        geom_boxplot(col='steelblue') + labs(x='Rating of Type 2 finished area') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+b10<- ggplot(data=table, aes(x=as.factor(BsmtFinType2))) +
+        geom_histogram(stat='count')+ labs(x='Rating of Type 2 finished area')
+
+b11<-ggplot(data=table, aes(x=factor(BsmtQual),y=SalePrice))+
+        geom_boxplot(col='steelblue') + labs(x='Height of the basement') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+b12<-ggplot(data=table, aes(x=as.factor(BsmtQual))) +
+        geom_histogram(stat='count')+ labs(x='Height of the basement')
+
+b13<-ggplot(data=table, aes(x=factor(BsmtCond),y=SalePrice))+
+        geom_boxplot(col='steelblue') + labs(x='Rating of general condition') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+b14 <- ggplot(data=table, aes(x=as.factor(BsmtCond))) +
+        geom_histogram(stat='count')+ labs(x='Rating of general condition')
+
+b15<-ggplot(data=table, aes(x=factor(BsmtExposure),y=SalePrice))+
+        geom_boxplot(col='steelblue') + labs(x='Walkout or garden level walls') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+b16 <- ggplot(data=table, aes(x=as.factor(BsmtExposure))) +
+        geom_histogram(stat='count')+ labs(x='Walkout or garden level walls')
+
+layout <- matrix(c(1:8),4,2,byrow=TRUE)
+multiplot(b1, b2, b3, b4, b5, b6, b7, b8, layout=layout)
+layout2 <- matrix(c(1:8),4,2,byrow=TRUE)
+multiplot(b9, b10, b11, b12, b13, b14, b15, b16, layout=layout2)
+```
+
+*
+So it seemed as if the Total Basement Surface in square feet (TotalBsmtSF) is further broken down into finished areas (2 if more than one type of finish), and unfinished area. I did a check between the correlation of total of those 3 variables, and TotalBsmtSF. The correlation is exactely 1, so that’s a good thing (no errors or small discrepancies)!
+
+Basement Quality is a confusing variable name, as it turns out that it specifically rates the Height of the basement.
+
+Then Neighborhoods
+
+```{r}
+table[,c('Neighborhood','SalePrice')] %>%
+  group_by(Neighborhood) %>%
+  summarise(median = median(SalePrice, na.rm = TRUE)) %>%
+  arrange(median) %>%
+  mutate(nhbr_sort = factor(Neighborhood,levels = Neighborhood)) %>%
+  ggplot(aes(x=nhbr_sort, y=median)) +
+  geom_point() +
+  geom_text(aes(label = median, angle = -45),vjust = -0.5,size=2) +
+  theme_minimal() +
+  labs(x='Neighborhood', y='Median price') +
+  theme(text = element_text(size=10),
+        axis.text.x = element_text(angle=-45,size = 10))
+```
+
+```{r}
+nbrh.map <- c('MeadowV' = 0, 'IDOTRR' = 1, 'BrDale' = 1, 'OldTown' = 2, 'Edwards' = 2, 
+             'BrkSide' = 2, 'Sawyer' = 3,'Blueste' = 3, 'SWISU' = 3, 'NAmes' = 3, 'NPkVill' = 3, 'Mitchel' = 4,
+             'SawyerW' = 4, 'Gilbert' = 5, 'NWAmes' = 5, 'Blmngtn' = 5, 'CollgCr' = 6, 'ClearCr' = 6, 
+             'Crawfor' = 6, 'Veenker' = 6, 'Somerst' = 7, 'Timber' = 7, 'StoneBr' = 8, 'NoRidge' = 9, 
+             'NridgHt' = 10)
+
+table$Neighclass<-as.integer(revalue(table$Neighborhood,nbrh.map))
+```
+
+
+Then MSSubClass
+
+```{r}
+table[,c('MSSubClass','SalePrice')] %>%
+  group_by(MSSubClass) %>%
+  summarise(median = median(SalePrice, na.rm = TRUE)) %>%
+  arrange(median) %>%
+  mutate(nhbr_sort = factor(MSSubClass,levels = MSSubClass)) %>%
+  ggplot(aes(x=nhbr_sort, y=median)) +
+  geom_point() +
+  geom_text(aes(label = median, angle = -45),vjust = -0.5,size=2) +
+  theme_minimal() +
+  labs(x='MSSubClass', y='Median price') +
+  theme(text = element_text(size=10),
+        axis.text.x = element_text(angle=-45,size = 10))
+```
+
+Then variables about Quality
+```{r}
+q1<-ggplot(data=table, aes(x=factor(OverallQual),y=SalePrice))+
+        geom_boxplot(col='steelblue') + labs(x='Overall Quality') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+q2 <- ggplot(data=table, aes(x=factor(OverallQual))) +
+        geom_histogram(stat='count') + labs(x='Overall Quality')
+
+q3<-ggplot(data=table, aes(x=factor(ExterQual),y=SalePrice))+
+        geom_boxplot(col='steelblue') + labs(x='Exterior Quality') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+q4 <- ggplot(data=table, aes(x=factor(ExterQual))) +
+        geom_histogram(stat='count') + labs(x='Exterior Quality')
+
+q5<-ggplot(data=table, aes(x=factor(BsmtQual),y=SalePrice))+
+        geom_boxplot(col='steelblue') + labs(x='Basement Quality') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+q6 <- ggplot(data=table, aes(x=factor(BsmtQual))) +
+        geom_histogram(stat='count') + labs(x='Basement Quality')
+
+q7<-ggplot(data=table, aes(x=factor(KitchenQual),y=SalePrice))+
+        geom_boxplot(col='steelblue') + labs(x='Kitchen Quality') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+q8 <- ggplot(data=table, aes(x=factor(KitchenQual))) +
+        geom_histogram(stat='count') + labs(x='Kitchen Quality')
+
+q9<-ggplot(data=table, aes(x=factor(GarageQual),y=SalePrice))+
+        geom_boxplot(col='steelblue') + labs(x='Garage Quality') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+q10 <- ggplot(data=table, aes(x=factor(GarageQual))) +
+        geom_histogram(stat='count') + labs(x='Garage Quality')
+
+q11<-ggplot(data=table, aes(x=factor(PoolQC),y=SalePrice))+
+        geom_boxplot(col='steelblue') + labs(x='Pool Quality') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+q12 <- ggplot(data=table, aes(x=factor(PoolQC))) +
+        geom_histogram(stat='count') + labs(x='Pool Quality')
+
+q13<-ggplot(data=table, aes(x=factor(FireplaceQu),y=SalePrice))+
+        geom_boxplot(col='steelblue') + labs(x='Fireplace Quality') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+q14 <- ggplot(data=table, aes(x=factor(FireplaceQu))) +
+        geom_histogram(stat='count') + labs(x='Fireplace Quality')
+
+layout <- matrix(c(1:8),4,2,byrow=TRUE)
+multiplot(q1, q2, q3, q4, q5, q6, q7, q8, layout=layout)
+layout2 <- matrix(c(1:6),3,2,byrow=TRUE)
+multiplot(q9, q10, q11, q12, q13, q14, layout=layout2)
+```
+
+*
+Overall Quality is very important, and also more granular than the other variables. External Quality is also improtant, but has a high correlation with Overall Quality (0.73). Kitchen Quality also seems one to keep, as all houses have a kitchen and there is a variance with some substance. Garage Quality does not seem to distinguish much, as the majority of garages have Q3. Fireplace Quality is in the list of high correlations, and in the important variables list. The PoolQC is just very sparse (the 13 pools cannot even be seen on this scale). I will look at creating a ‘has pool’ variable later on.
+
+
+Feature engineering
+
+1. total bathroom:
+
+```{r}
+table$TotBathrooms <- table$FullBath + (table$HalfBath*0.5) + table$BsmtFullBath + (table$BsmtHalfBath*0.5)
+```
+```{r}
+cor(table$TotBathrooms,table$SalePrice)
+```
+
+2.Consolidating Porch variables
+
+```{r}
+table$TotalPorchSF <- table$OpenPorchSF + table$EnclosedPorch + table$X3SsnPorch + table$ScreenPorch
+cor(table$SalePrice, table$TotalPorchSF)
+```
+
+3.YearBlt, YearRemodAdd, and YearSold
+
+if house is new
+```{r}
+table$newornot <- ifelse(table$YearBuilt==table$YrSold, 1, 0)
+
+ggplot(table[!is.na(table$SalePrice),], aes(x=as.factor(newornot), y=SalePrice)) +
+        geom_bar(stat='summary', fun.y='mean', fill='steelblue') +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=6) +
+        scale_y_continuous(breaks= seq(0, 800000, by=50000), labels = comma) 
+cor(table$SalePrice, table$newornot)
+     
+table$YrSold <- as.factor(table$YrSold)
+```
+
+house age
+```{r}
+table$age<-as.numeric(table$YrSold)-table$YearRemodAdd
+ggplot(data=table[!is.na(table$SalePrice),], aes(x=age, y=SalePrice))+
+        geom_point(col='steelblue') + 
+        geom_smooth(method = "lm", se=FALSE, color="orange", aes(group=1)) +
+        geom_smooth(method = "loess", se=FALSE, color="yellow", aes(group=1))
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+cor(table$SalePrice[!is.na(table$SalePrice)], table$age[!is.na(table$SalePrice)])
+```
+
+
+if the house is remodeled
+```{r}
+table$remod <- ifelse(table$YearBuilt==table$YearRemodAdd, 0, 1)
+```
+
+
+Next normalize data
+
+1. there are two unreasonable record: 1299 and 524. I remove these 2 records.
+
+```{r}
+table<-table[-c(1299,524)]
+```
+
+
+
+2. delete variables which are high correlated
+first TotalArea, GrLivArea, TotalBsmtSF, x1stfirsf, TotalRmsAbvGrd, BsmtFinSF1; GarageCar and GarageArea;YearBulit YearRemodAdd GarageYrBlt.
+
+```{r}
+dropve<-c('YearRemodAdd', 'GarageYrBlt', 'YearBuilt', 'GarageArea', 'GarageFinish', 'GarageCond', 'TotalBsmtSF', 'TotalRmsAbvGrd', 'BsmtFinSF1','OpenPorchSF','EnclosedPorch', 'X3SsnPorch',  'ScreenPorch','FullBath', 'HalfBath','BsmtFullBath', 'BsmtHalfBath','LowQualFinSF', 'X1stFlrSF', 'X2ndFlrSF','LowQualFinSF','BsmtCond','GrLivArea','Neighborhood' )
+table<-table[,!(names(table) %in% dropve)]
+
+```
+
+
+```{r}
+#num_copy<-copy(num_var)
+num_var_new<-num_var_name[!(num_var_name %in% c('MSSubClass', 'MoSold', 'YrSold', 'SalePrice', 'OverallQual', 'OverallCond')) & !(num_var_name %in% dropve) ]
+num_var_new <- append(num_var_new, c('age', 'TotalPorchSF', 'TotBathrooms'))
+length(num_var_new)
+```
+
+Then there are 18 numeric variables.
+
+Skewness and normalize of numeric predictor
+
+```{r}
+df_num<-table[,names(table) %in% num_var_new]
+```
+```{r}
+for(i in 1:ncol(df_num)){
+        if (abs(skew(df_num[,i]))>0.75){
+                df_num[,i] <- log(df_num[,i] +1)
+        }
+}
+
+```
+
+```{r}
+prenum <- preProcess(df_num, method=c("center", "scale"))
+print(prenum)
+```
+```{r}
+df_nor <- predict(prenum, df_num)
+```
+
+```{r}
+df_fac <- table[, !(names(table) %in% num_var_new)]
+df_fac <- df_fac[, names(df_fac) != 'SalePrice']
+```
+
+```{r}
+com_var<-cbind(df_nor, df_fac)
+sum(is.na(com_var))
+names(com_var)
+```
+
+skewness of response variable
+```{r}
+skew(table$SalePrice)
+qqnorm(table$SalePrice)
+qqline(table$SalePrice)
+```
+
+```{r}
+table$SalePrice <- log(table$SalePrice)
+qqnorm(table$SalePrice)
+qqline(table$SalePrice)
+```
+
+
+```{r}
+set.seed(10)
+model1.rf<-randomForest(x=com_var, y=table$SalePrice, ntree=100,importance=TRUE)
+model1.rf<-importance(model1.rf,2)
+#imp_df<-data.frame(Variables = row.names(imp_rf), MSE = imp_rf[,1])
+#imp_df<-imp_df[order(imp_df$MSE, decreasing = TRUE),]
+```
+
+```{r}
+sort_var<-model1.rf[order(model1.rf,decreasing = TRUE),]
+sort_var
+```
+
+So here TotalArea, OverallQual, Neighclass, TotBathrooms, KitchenQual, GarageCars, BsmtQual, ExterQual, MSSubClass, age, MoSold
+
+```{r}
+set.seed(2)
+model2.rf<-randomForest(x=com_var, y=table$SalePrice, ntree=100,importance=TRUE)
+imp_rf<-importance(model2.rf,2)
+imp_df<-data.frame(Variables = row.names(imp_rf), MSE = imp_rf[,1])
+imp_df<-imp_df[order(imp_df$MSE, decreasing = TRUE),]
+```
+```{r}
+imp_df
+```
+
+```{r}
+model_rf <- randomForest(SalePrice ~ TotalArea + OverallQual+ Neighclass+ TotBathrooms+ KitchenQual+ GarageCars+ BsmtQual+ ExterQual+ MSSubClass+ MoSold+ age,
+              data=table,
+                       # Number of variates to select at each step
+                       mtry = 3)
+```
+
+
+
+```{r}
+lmgam <- gam(table$SalePrice ~ TotalArea + OverallQual+ Neighclass+ TotBathrooms+ KitchenQual+ GarageCars+ BsmtQual+ ExterQual+ MSSubClass+ MoSold+ age,
+              data=table)
+summary(lmgam)
+```
+
+```{r}
+ns_model<-lm(table$SalePrice~ ns(TotalArea) + OverallQual+ Neighclass+ ns(TotBathrooms)+ KitchenQual+ ns(GarageCars) + BsmtQual+ ExterQual+ MSSubClass+ MoSold+ ns(age), data=table)
+summary(ns_model)
+```
+
+```{r}
+layout(matrix(c(1,2,3,4),2,2)) # optional 4 graphs/page 
+plot(ns_model)
+```
+
+
+```{r}
+form<-SalePrice~ (ns(TotalArea) + OverallQual+ Neighclass+ ns(TotBathrooms)+ KitchenQual+ ns(GarageCars) + BsmtQual+ ExterQual+ MSSubClass+ MoSold+ ns(age))
+g<-lm(form,data=table)
+a<-cv.lm(data =table,form.lm=form,m=5)
+```
+
+```{r}
+tep <- stepAIC(ns_model, direction="both")
+```
+
+ns(TotalArea) + OverallQual + Neighclass + 
+    ns(TotBathrooms) + KitchenQual + ns(GarageCars) + MSSubClass + 
+    ns(age)
+    
+    
+```{r}
+cat_reg_splines<- crs(SalePrice ~ TotalArea + OverallQual+ Neighclass+ TotBathrooms+ KitchenQual+ GarageCars+ BsmtQual+ ExterQual+ MSSubClass+ MoSold+ age,
+              data=table,#integer/vector specifying the polynomial degree of the B-spline basis for each dimension of the continuous x (default degree=3, i.e. cubic spline),
+              cv="none",
+              kernel=TRUE)
+```
+
+
+```{r}
+summary(cat_reg_splines)
+```
+
+
+```{r}
+df_dum <- as.data.frame(model.matrix(~.-1, df_fac))
+ZerocolTrain <- which(colSums(df_dum[1:nrow(table[!is.na(table$SalePrice),]),])==0)
+colnames(df_dum[,-ZerocolTrain])
+fewOnes <- which(colSums(df_dum[1:nrow(table[!is.na(table$SalePrice),]),])<10)
+colnames(df_dum[fewOnes])
+df_dum2 <- df_dum[,-fewOnes]
+com_var2<-cbind(df_nor, df_dum2)
+```
+
+
+
+```{r}
+set.seed(27042018)
+my_control <-trainControl(method="cv", number=5)
+lassoGrid <- expand.grid(alpha = 1, lambda = seq(0.001,0.1,by = 0.0005))
+
+lasso_mod <- train(x=com_var2, y=table$SalePrice[!is.na(table$SalePrice)], method='glmnet', trControl= my_control, tuneGrid=lassoGrid) 
+lasso_mod$bestTune
+```
+```{r}
+min(lasso_mod$results$RMSE)
+```
+mse_eval <- sum((y.true - exp(y.pred)-1)^2) / length(y.true)
+sqrt(mse_eval)
+```{r}
+varImp(lasso_mod)
+```
+
+
+```{r}
+rf_model <- train(x=com_var2, y=table$SalePrice[!is.na(table$SalePrice)], data=table,method="rf",metric="RMSE",
+                     maximize=FALSE,trControl=trainControl(method="repeatedcv",number=5),
+                     tuneGrid=expand.grid(mtry = c(5)), importance = T, allowParallel = T, prox = T)
+rf_model$result
+```
+
+```{r}
+rf_model$results
+```
+
+```{r}
+varImp(rf_model)
+```
+
+Gradient Boosting
+```{r}
+library(gbm)
+gbm_model <- gbm(SalePrice ~., data = table, distribution = "laplace",
+              n.trees = 100)
+```
+```{r}
+predict_gbm <- predict(gbm_model,table,n.trees = 100)
+RMSE3 <- RMSE(predict_gbm, table$SalePrice)
+RMSE3
+```
+
+
+XGboost
+
+```{r}
+xgb_grid = expand.grid(
+nrounds = 1000,
+eta = c(0.1, 0.05, 0.01),
+max_depth = c(3, 4, 5, 6),
+gamma = 0,
+colsample_bytree=1,
+min_child_weight=c( 3, 4 ,5),
+subsample=1
+)
+xgb_caret <- train(x=com_var2, y=table$SalePrice[!is.na(table$SalePrice)], method='xgbTree', trControl= my_control, tuneGrid=xgb_grid) 
+xgb_caret$bestTune
+
+```
+
+```{r}
+xgb_params <- list(
+  booster = 'gbtree',
+  objective = 'reg:linear',
+  colsample_bytree=1,
+  eta=0.05,
+  max_depth=4,
+  min_child_weight=4,
+  alpha=0.3,
+  lambda=0.4,
+  gamma=0.01, # less overfit
+  subsample=0.6,
+  seed=5,
+  silent=TRUE)
+
+df_xgboost <- xgb.DMatrix(data = as.matrix(com_var2), label= table$SalePrice)
+xgbcv <- xgb.cv( params = xgb_params, data =df_xgboost, nrounds = 500, nfold = 5, showsd = T, stratified = T, print_every_n = 40, early_stopping_rounds = 10, maximize = F)
+```
+
+```{r}
+xgb_mod <- xgb.train(data = df_xgboost, params=xgb_params, nrounds =205)
+
+```
+```{r}
+mat <- xgb.importance (feature_names = colnames(com_var2),model = xgb_mod)
+xgb.ggplot.importance(importance_matrix = mat[1:20], rel_to_first = TRUE)
+```
+
