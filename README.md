@@ -1,4 +1,5 @@
-# data-visualization
+# Data-Visualization
+
 # Online news popularity analysis
 In this project, I intend to analysis if an article will become popular or not by using features like type of content, number of images/videos , the day on which the paper was published, etc. The data set from UCI website summarizes a heterogeneous set of features about articles published by Mashable in a period of two years. Dataset consists of 61 attributes: 58 predictive attributes, 2 non-predictive, 1 goal field.
 
